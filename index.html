@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Perspective Grid</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:'SF Mono','Consolas','Menlo',monospace;
+  background:#fff;color:#333;
+  overflow:hidden;height:100vh;
+  display:flex;flex-direction:column;
+  user-select:none;-webkit-user-select:none;
+}
+#toolbar{
+  display:flex;align-items:center;gap:12px;
+  padding:6px 12px;background:#f4f4f4;
+  border-bottom:1px solid #ddd;
+  flex-wrap:wrap;font-size:11px;z-index:10;
+}
+#toolbar button{
+  background:#e6e6e6;color:#333;
+  border:1px solid #c5c5c5;padding:3px 9px;
+  border-radius:3px;cursor:pointer;
+  font-size:11px;font-family:inherit;
+  transition:background .1s;
+  white-space:nowrap;
+}
+#toolbar button:hover{background:#d8d8d8}
+#toolbar button:disabled{opacity:.35;cursor:not-allowed}
+#toolbar button.preset{background:#333;color:#fff;border-color:#222}
+#toolbar button.preset:hover{background:#444}
+.sep{border-left:1px solid #ccc;height:18px;flex-shrink:0}
+.vp-tag{display:inline-flex;align-items:center;gap:3px}
+.vp-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.vp-rm{
+  background:none!important;border:none!important;
+  color:#999;cursor:pointer;font-size:13px;
+  padding:0 1px;line-height:1;
+}
+.vp-rm:hover{color:#e33}
+.sg{display:flex;align-items:center;gap:4px}
+.sg input[type=range]{width:64px;accent-color:#888}
+.sg .v{width:34px;text-align:right}
+#canvas-wrap{flex:1;position:relative;overflow:hidden;cursor:default}
+canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+.toast{
+  position:fixed;bottom:20px;left:50%;
+  transform:translateX(-50%);
+  background:#333;color:#fff;
+  padding:5px 14px;border-radius:4px;
+  font-size:11px;opacity:0;
+  transition:opacity .25s;
+  pointer-events:none;z-index:100;
+}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <!-- Presets -->
+  <button class="preset" id="p-2pt">2-Pt</button>
+  <button class="preset" id="p-3pt">3-Pt</button>
+  <button class="preset" id="p-5pt">5-Pt Fish</button>
+  <span class="sep"></span>
+
+  <!-- VP controls -->
+  <button id="btn-add">+ VP (<span id="vp-count">0</span>/5)</button>
+  <span id="vp-tags"></span>
+  <span class="sep"></span>
+
+  <!-- Sliders -->
+  <div class="sg">
+    <label>Opacity</label>
+    <input type="range" id="sl-op" min="2" max="50" value="12">
+    <span class="v" id="v-op">12%</span>
+  </div>
+  <span class="sep"></span>
+  <div class="sg">
+    <label>Focal</label>
+    <input type="range" id="sl-fl" min="14" max="200" value="50">
+    <span class="v" id="v-fl">50mm</span>
+  </div>
+  <span class="sep"></span>
+
+  <!-- Flip -->
+  <button id="btn-fh">↔ Flip H</button>
+  <button id="btn-fv">↕ Flip V</button>
+  <span class="sep"></span>
+
+  <!-- Actions -->
+  <button id="btn-copy">📋 Copy</button>
+  <button id="btn-dl">⬇ PNG</button>
+</div>
+
+<div id="canvas-wrap">
+  <canvas id="cv"></canvas>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const COLORS=["#e03030","#2080dd","#20b060","#dd8820","#9940cc"];
+const HZ_COL="#ff6600";
+const VP_R=10;
+
+const cv=document.getElementById("cv");
+const ctx=cv.getContext("2d");
+const wrap=document.getElementById("canvas-wrap");
+
+let W=800,H=600,dpr=1;
+let vps=[];
+let opacity=0.12;
+let focalMM=50;
+let dragging=null;
+let dragOff={x:0,y:0};
+let flipH=false, flipV=false;
+let curveMode=false;
+
+/* ---- resize ---- */
+function resize(){
+  const r=wrap.getBoundingClientRect();
+  dpr=devicePixelRatio||1;
+  W=Math.floor(r.width*dpr);
+  H=Math.floor(r.height*dpr);
+  cv.width=W; cv.height=H;
+  draw();
+}
+new ResizeObserver(resize).observe(wrap);
+
+/* ---- CSS ↔ pixel helpers ---- */
+function cssW(){return W/dpr}
+function cssH(){return H/dpr}
+function toP(v){return v*dpr}       // css→pixel
+function toC(v){return v/dpr}       // pixel→css
+
+/* ---- horizon from VPs (least-squares) ---- */
+function horizon(){
+  if(vps.length===0) return{a:0,cy:H/2};
+  if(vps.length===1) return{a:0,cy:toP(vps[0].y)};
+  const pts=vps.map(v=>({x:toP(v.x),y:toP(v.y)}));
+  const n=pts.length;
+  let sx=0,sy=0,sxx=0,sxy=0;
+  for(const p of pts){sx+=p.x;sy+=p.y;sxx+=p.x*p.x;sxy+=p.x*p.y}
+  const d=n*sxx-sx*sx;
+  if(Math.abs(d)<1e-6) return{a:Math.PI/2,cy:sy/n};
+  const m=(n*sxy-sx*sy)/d;
+  const b=(sy-m*sx)/n;
+  return{a:Math.atan(m),cy:m*(W/2)+b};
+}
+
+/* ---- line count from focal length ---- */
+function lc(){
+  const t=(focalMM-14)/(200-14);
+  return Math.round(72-t*58);
+}
+
+/* ---- edge proxy for off-screen VPs ---- */
+const PROXY_R=14;
+const EDGE_PAD=22;
+let proxyPositions=[];
+
+function computeProxies(){
+  proxyPositions=[];
+  const cw=cssW(), ch=cssH(), pad=EDGE_PAD;
+  vps.forEach((vp,i)=>{
+    if(vp.x>=-VP_R && vp.x<=cw+VP_R && vp.y>=-VP_R && vp.y<=ch+VP_R) return;
+    const cx=cw/2, cy=ch/2;
+    const dx=vp.x-cx, dy=vp.y-cy;
+    if(dx===0&&dy===0) return;
+    const l=pad, r=cw-pad, tp=pad, bt=ch-pad;
+    let t=Infinity;
+    if(dx!==0){
+      let t1=(l-cx)/dx; if(t1>0){let yy=cy+dy*t1; if(yy>=tp&&yy<=bt) t=Math.min(t,t1);}
+      let t2=(r-cx)/dx;  if(t2>0){let yy=cy+dy*t2; if(yy>=tp&&yy<=bt) t=Math.min(t,t2);}
+    }
+    if(dy!==0){
+      let t3=(tp-cy)/dy; if(t3>0){let xx=cx+dx*t3; if(xx>=l&&xx<=r) t=Math.min(t,t3);}
+      let t4=(bt-cy)/dy; if(t4>0){let xx=cx+dx*t4; if(xx>=l&&xx<=r) t=Math.min(t,t4);}
+    }
+    if(t===Infinity) return;
+    proxyPositions.push({x:cx+dx*t, y:cy+dy*t, vpIdx:i});
+  });
+}
+
+/* ---- fisheye curved grid ---- */
+function drawFisheyeGrid(diag, numLines){
+  // VP order: [center(0), left(1), right(2), top(3), bottom(4)]
+  const c={x:toP(vps[0].x),y:toP(vps[0].y)};
+  const l={x:toP(vps[1].x),y:toP(vps[1].y)};
+  const r={x:toP(vps[2].x),y:toP(vps[2].y)};
+  const t={x:toP(vps[3].x),y:toP(vps[3].y)};
+  const b={x:toP(vps[4].x),y:toP(vps[4].y)};
+
+  const half=Math.floor(numLines/2);
+
+  // Helper: quadratic bezier control point so curve passes through M at t=0.5
+  function cp(s,e,m){return{x:2*m.x-0.5*s.x-0.5*e.x, y:2*m.y-0.5*s.y-0.5*e.y}}
+
+  // Helper: lerp between two points
+  function lerp(a,b,f){return{x:a.x+(b.x-a.x)*f, y:a.y+(b.y-a.y)*f}}
+
+  // --- Horizontal curves: left ↔ right, spread along top↔bottom axis ---
+  ctx.save();
+  ctx.strokeStyle=COLORS[1];
+  ctx.globalAlpha=opacity;
+  ctx.lineWidth=0.7*dpr;
+  for(let i=-half;i<=half;i++){
+    const frac=i/half; // -1 → 1
+    // midpoint: interpolate from center toward top (frac<0) or bottom (frac>0)
+    const mid=frac>=0?lerp(c,b,frac):lerp(c,t,-frac);
+    const ctrl=cp(l,r,mid);
+    ctx.beginPath();
+    ctx.moveTo(l.x,l.y);
+    ctx.quadraticCurveTo(ctrl.x,ctrl.y,r.x,r.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // --- Vertical curves: top ↔ bottom, spread along left↔right axis ---
+  ctx.save();
+  ctx.strokeStyle=COLORS[3];
+  ctx.globalAlpha=opacity;
+  ctx.lineWidth=0.7*dpr;
+  for(let i=-half;i<=half;i++){
+    const frac=i/half;
+    const mid=frac>=0?lerp(c,r,frac):lerp(c,l,-frac);
+    const ctrl=cp(t,b,mid);
+    ctx.beginPath();
+    ctx.moveTo(t.x,t.y);
+    ctx.quadraticCurveTo(ctrl.x,ctrl.y,b.x,b.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // --- Radial lines from center VP ---
+  ctx.save();
+  ctx.strokeStyle=COLORS[0];
+  ctx.globalAlpha=opacity*0.6;
+  ctx.lineWidth=0.5*dpr;
+  const radials=Math.max(12,Math.floor(numLines*0.6));
+  for(let i=0;i<radials;i++){
+    const a=(i/radials)*Math.PI*2;
+    ctx.beginPath();
+    ctx.moveTo(c.x,c.y);
+    ctx.lineTo(c.x+Math.cos(a)*diag, c.y+Math.sin(a)*diag);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // --- Diagonal curves: top-left↔bottom-right & top-right↔bottom-left ---
+  ctx.save();
+  ctx.strokeStyle=COLORS[4];
+  ctx.globalAlpha=opacity*0.5;
+  ctx.lineWidth=0.5*dpr;
+  const tl=lerp(t,l,0.5);
+  const br=lerp(b,r,0.5);
+  const tr=lerp(t,r,0.5);
+  const bl=lerp(b,l,0.5);
+  const diagHalf=Math.floor(half*0.6);
+  for(let i=-diagHalf;i<=diagHalf;i++){
+    const frac=i/diagHalf;
+    // diagonal set 1: tl ↔ br
+    const mid1=frac>=0?lerp(c,lerp(r,b,0.5),frac):lerp(c,lerp(l,t,0.5),-frac);
+    const c1=cp(tl,br,mid1);
+    ctx.beginPath();
+    ctx.moveTo(tl.x,tl.y);
+    ctx.quadraticCurveTo(c1.x,c1.y,br.x,br.y);
+    ctx.stroke();
+    // diagonal set 2: tr ↔ bl
+    const mid2=frac>=0?lerp(c,lerp(l,b,0.5),frac):lerp(c,lerp(r,t,0.5),-frac);
+    const c2=cp(tr,bl,mid2);
+    ctx.beginPath();
+    ctx.moveTo(tr.x,tr.y);
+    ctx.quadraticCurveTo(c2.x,c2.y,bl.x,bl.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ---- draw ---- */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle="#fff";
+  ctx.fillRect(0,0,W,H);
+
+  // Apply flip transform
+  ctx.save();
+  ctx.translate(flipH?W:0, flipV?H:0);
+  ctx.scale(flipH?-1:1, flipV?-1:1);
+
+  const diag=Math.sqrt(W*W+H*H)*1.5;
+  const hz=horizon();
+  const lines=lc();
+
+  // horizon
+  const hcx=W/2, hcy=hz.cy;
+  ctx.save();
+  ctx.strokeStyle=HZ_COL;
+  ctx.lineWidth=1.5*dpr;
+  ctx.globalAlpha=0.45;
+  ctx.setLineDash([8*dpr,6*dpr]);
+  ctx.beginPath();
+  ctx.moveTo(hcx-Math.cos(hz.a)*diag, hcy-Math.sin(hz.a)*diag);
+  ctx.lineTo(hcx+Math.cos(hz.a)*diag, hcy+Math.sin(hz.a)*diag);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // grid lines
+  if(curveMode && vps.length>=5){
+    drawFisheyeGrid(diag,lines);
+  } else {
+    vps.forEach((vp,vi)=>{
+      const px=toP(vp.x), py=toP(vp.y);
+      ctx.save();
+      ctx.strokeStyle=COLORS[vi%COLORS.length];
+      ctx.globalAlpha=opacity;
+      ctx.lineWidth=0.7*dpr;
+      for(let i=0;i<lines;i++){
+        const a=(i/lines)*Math.PI*2;
+        ctx.beginPath();
+        ctx.moveTo(px,py);
+        ctx.lineTo(px+Math.cos(a)*diag, py+Math.sin(a)*diag);
+        ctx.stroke();
+      }
+      ctx.restore();
+    });
+  }
+
+  // VP handles
+  vps.forEach((vp,vi)=>{
+    const px=toP(vp.x), py=toP(vp.y);
+    const r=VP_R*dpr;
+    ctx.save();
+    // outer ring
+    ctx.strokeStyle=COLORS[vi%COLORS.length];
+    ctx.lineWidth=2*dpr;
+    ctx.globalAlpha=0.5;
+    ctx.beginPath();
+    ctx.arc(px,py,r+3*dpr,0,Math.PI*2);
+    ctx.stroke();
+    // filled circle
+    ctx.fillStyle=COLORS[vi%COLORS.length];
+    ctx.globalAlpha=0.9;
+    ctx.beginPath();
+    ctx.arc(px,py,r,0,Math.PI*2);
+    ctx.fill();
+    // label (counter-flip so text reads normally)
+    ctx.fillStyle="#fff";
+    ctx.globalAlpha=1;
+    ctx.font=`bold ${10*dpr}px monospace`;
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.save();
+    ctx.translate(px,py);
+    ctx.scale(flipH?-1:1, flipV?-1:1);
+    ctx.fillText(vi+1,0,0);
+    ctx.restore();
+    ctx.restore();
+  });
+
+  // Edge proxy markers for off-screen VPs
+  computeProxies();
+  proxyPositions.forEach(pr=>{
+    const vi=pr.vpIdx;
+    const px=toP(pr.x), py=toP(pr.y);
+    const r=PROXY_R*dpr;
+    const col=COLORS[vi%COLORS.length];
+    // draw arrow-like marker
+    ctx.save();
+    // direction arrow
+    const ang=Math.atan2(vps[vi].y-pr.y, vps[vi].x-pr.x);
+    ctx.translate(px,py);
+    ctx.rotate(ang);
+    // rounded triangle pointing outward
+    ctx.fillStyle=col;
+    ctx.globalAlpha=0.85;
+    ctx.beginPath();
+    ctx.moveTo(r*0.7,0);
+    ctx.lineTo(-r*0.5, -r*0.6);
+    ctx.lineTo(-r*0.5, r*0.6);
+    ctx.closePath();
+    ctx.fill();
+    // circle bg
+    ctx.globalAlpha=0.7;
+    ctx.beginPath();
+    ctx.arc(0,0,r*0.65,0,Math.PI*2);
+    ctx.fill();
+    // label
+    ctx.rotate(-ang);
+    ctx.scale(flipH?-1:1, flipV?-1:1);
+    ctx.fillStyle="#fff";
+    ctx.globalAlpha=1;
+    ctx.font=`bold ${9*dpr}px monospace`;
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.fillText(vi+1,0,0);
+    ctx.restore();
+  });
+
+  // End flip transform
+  ctx.restore();
+}
+
+/* ---- pointer helpers ---- */
+function cssPos(e){
+  const rect=wrap.getBoundingClientRect();
+  const cx=e.touches?e.touches[0].clientX:e.clientX;
+  const cy=e.touches?e.touches[0].clientY:e.clientY;
+  return{x:cx-rect.left, y:cy-rect.top};
+}
+
+function onDown(e){
+  e.preventDefault();
+  const p=cssPos(e);
+  // Hit-test on-screen VP handles first
+  for(let i=vps.length-1;i>=0;i--){
+    if(Math.hypot(p.x-vps[i].x, p.y-vps[i].y)<VP_R+6){
+      dragging=i;
+      dragOff.x=vps[i].x-p.x;
+      dragOff.y=vps[i].y-p.y;
+      cv.style.cursor="grabbing";
+      return;
+    }
+  }
+  // Hit-test edge proxy markers
+  for(let j=proxyPositions.length-1;j>=0;j--){
+    const pr=proxyPositions[j];
+    if(Math.hypot(p.x-pr.x, p.y-pr.y)<PROXY_R+4){
+      dragging=pr.vpIdx;
+      dragOff.x=vps[pr.vpIdx].x-p.x;
+      dragOff.y=vps[pr.vpIdx].y-p.y;
+      cv.style.cursor="grabbing";
+      return;
+    }
+  }
+}
+function onMove(e){
+  if(dragging===null){
+    const p=cssPos(e);
+    let hit=false;
+    for(let i=vps.length-1;i>=0;i--){
+      if(Math.hypot(p.x-vps[i].x,p.y-vps[i].y)<VP_R+6){hit=true;break}
+    }
+    if(!hit){
+      for(let j=proxyPositions.length-1;j>=0;j--){
+        if(Math.hypot(p.x-proxyPositions[j].x,p.y-proxyPositions[j].y)<PROXY_R+4){hit=true;break}
+      }
+    }
+    cv.style.cursor=hit?"grab":"default";
+    return;
+  }
+  e.preventDefault();
+  const p=cssPos(e);
+  // No clamping — allow beyond bounds
+  vps[dragging].x=p.x+dragOff.x;
+  vps[dragging].y=p.y+dragOff.y;
+  draw();
+}
+function onUp(){dragging=null;cv.style.cursor="default"}
+
+cv.addEventListener("mousedown",onDown);
+cv.addEventListener("touchstart",onDown,{passive:false});
+document.addEventListener("mousemove",onMove);
+document.addEventListener("touchmove",onMove,{passive:false});
+document.addEventListener("mouseup",onUp);
+document.addEventListener("touchend",onUp);
+
+/* ---- toolbar ---- */
+function renderTags(){
+  const el=document.getElementById("vp-tags");
+  el.innerHTML=vps.map((_,i)=>
+    `<span class="vp-tag"><span class="vp-dot" style="background:${COLORS[i]}"></span>VP${i+1}<button class="vp-rm" data-i="${i}">×</button></span>`
+  ).join(" ");
+  document.getElementById("vp-count").textContent=vps.length;
+  document.getElementById("btn-add").disabled=vps.length>=5;
+  el.querySelectorAll(".vp-rm").forEach(b=>{
+    b.onclick=()=>{vps.splice(+b.dataset.i,1);renderTags();draw()};
+  });
+}
+
+document.getElementById("btn-add").onclick=()=>{
+  if(vps.length>=5)return;
+  vps.push({x:cssW()/2+(Math.random()-.5)*180, y:cssH()/2+(Math.random()-.5)*120});
+  renderTags();draw();
+};
+
+document.getElementById("sl-op").oninput=function(){
+  opacity=this.value/100;
+  document.getElementById("v-op").textContent=this.value+"%";
+  draw();
+};
+document.getElementById("sl-fl").oninput=function(){
+  focalMM=+this.value;
+  document.getElementById("v-fl").textContent=focalMM+"mm";
+  draw();
+};
+
+/* ---- presets ---- */
+function setPreset(list, curved){
+  curveMode=!!curved;
+  vps=list;
+  renderTags();draw();
+}
+
+document.getElementById("p-2pt").onclick=()=>{
+  const cw=cssW(), ch=cssH(), cy=ch*0.45;
+  setPreset([
+    {x:-cw*0.3, y:cy},
+    {x:cw*1.3,  y:cy},
+  ], false);
+};
+
+document.getElementById("p-3pt").onclick=()=>{
+  const cw=cssW(), ch=cssH(), cy=ch*0.38;
+  setPreset([
+    {x:-cw*0.25, y:cy},
+    {x:cw*1.25,  y:cy},
+    {x:cw*0.5,   y:ch*1.4},
+  ], false);
+};
+
+document.getElementById("p-5pt").onclick=()=>{
+  const cw=cssW(), ch=cssH();
+  const cx=cw/2, cy_=ch/2;
+  const spread=Math.max(cw,ch)*0.7;
+  setPreset([
+    {x:cx,          y:cy_},           // center
+    {x:cx-spread,   y:cy_},           // left
+    {x:cx+spread,   y:cy_},           // right
+    {x:cx,          y:cy_-spread},     // top
+    {x:cx,          y:cy_+spread},     // bottom
+  ], true);
+};
+
+/* ---- flip ---- */
+function updateFlipBtns(){
+  document.getElementById("btn-fh").style.background=flipH?"#333":"";
+  document.getElementById("btn-fh").style.color=flipH?"#fff":"";
+  document.getElementById("btn-fv").style.background=flipV?"#333":"";
+  document.getElementById("btn-fv").style.color=flipV?"#fff":"";
+}
+document.getElementById("btn-fh").onclick=()=>{flipH=!flipH;updateFlipBtns();draw()};
+document.getElementById("btn-fv").onclick=()=>{flipV=!flipV;updateFlipBtns();draw()};
+
+/* ---- copy / download ---- */
+document.getElementById("btn-copy").onclick=async()=>{
+  try{
+    const blob=await new Promise(r=>cv.toBlob(r,"image/png"));
+    await navigator.clipboard.write([new ClipboardItem({"image/png":blob})]);
+    toast("Copied to clipboard");
+  }catch(e){toast("Copy failed — use Download instead")}
+};
+
+document.getElementById("btn-dl").onclick=()=>{
+  cv.toBlob(blob=>{
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download="perspective-grid.png";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("Downloaded");
+  },"image/png");
+};
+
+function toast(msg){
+  const t=document.getElementById("toast");
+  t.textContent=msg;t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"),1600);
+}
+
+/* ---- init ---- */
+renderTags();
+resize();
+</script>
+</body>
+</html>
